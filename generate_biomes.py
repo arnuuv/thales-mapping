@@ -1,40 +1,49 @@
 #!/usr/bin/env python3
 """
-Procedural fictitious biome generator (FOREST / MOUNTAIN)
+Procedural fictitious biome generator (FOREST / MOUNTAIN / DESERT / CITY)
 Fast, detailed, QGIS‑friendly layered outputs written to separate folders.
 
 Usage examples
 --------------
-# Forest, 2048 px, quick
+# Forest, 2048 px
 python generate_biomes.py --biome forest --size 2048 --seed 7 --outdir output/forest
 
 # Mountain, 2048 px
 python generate_biomes.py --biome mountain --size 2048 --seed 11 --outdir output/mountain
 
+# Desert, 2048 px
+python generate_biomes.py --biome desert --size 2048 --seed 13 --outdir output/desert
+
+# City, 2048 px
+python generate_biomes.py --biome city --size 2048 --seed 21 --outdir output/city
+
 What you get in outdir/
 -----------------------
+Common layers (all biomes)
 - rgb.tif            (3‑band baseline GeoTIFF, EPSG:3857)
 - dem.tif            (1‑band DEM 0..1)
 - hillshade.tif      (1‑band 0..1)
 - slope.tif          (1‑band 0..1)
-- water.tif          (1‑band water mask 0/1)
-- cover.tif          (1‑band landcover classes: see legend below)
+- water.tif          (1‑band water mask 0/1: rivers/coast)
+- cover.tif          (1‑band landcover classes — legend below)
 - preview.png        (styled PNG for quick look)
+
+Extra layers by biome
+- CITY: urban.tif (0/1 mask), roads.tif (0/1 mask)
 
 Landcover legend (cover.tif)
 ----------------------------
-FOREST biome:
-0=water, 1=grass, 2=forest_light, 3=forest_dense, 4=rock/snow
-
-MOUNTAIN biome:
-0=water, 1=alpine_meadow, 2=subalpine_forest, 3=bare_rock, 4=snow/ice
+FOREST: 0=water, 1=grass, 2=forest_light, 3=forest_dense, 4=rock/snow
+MOUNTAIN: 0=water, 1=alpine_meadow, 2=subalpine_forest, 3=bare_rock, 4=snow/ice
+DESERT: 0=water, 1=sand, 2=semi_arid_shrub, 3=rocky_plateau, 4=erg_dune_crests
+CITY: 0=water, 1=urban_low, 2=urban_med, 3=urban_high, 4=park/green
 
 Notes
 -----
 * No GDAL dependency; only numpy, pillow, rasterio.
 * Rivers via fast D8 flow accumulation (topological pass).
-* Extra micro‑detail added with high‑freq noise + ambient light.
-* Baseline GeoTIFF (no tiling/compression) for macOS Preview and QGIS.
+* Extra micro‑detail and ambient light for realism.
+* Baseline GeoTIFFs (no tiling/compression) for maximum compatibility.
 """
 from __future__ import annotations
 import argparse
@@ -88,12 +97,23 @@ def fbm(w: int, h: int, octaves=6, lacunarity=2.0, gain=0.5, base_grid=128, seed
     total /= (1.0 - gain**octaves) / (1.0 - gain) if gain != 1 else octaves
     return total
 
+# Directional dunes noise for desert
+
+def dunes_noise(w: int, h: int, seed: int, scale=32, direction_deg=20) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    base = value_noise(w, h, max(2, scale), rng)
+    yy, xx = np.mgrid[0:h, 0:w]
+    theta = math.radians(direction_deg)
+    ridges = np.cos((xx*np.cos(theta) + yy*np.sin(theta)) / (scale*0.6) + base*3.14)
+    ridges = (ridges + 1) * 0.5
+    return ridges.astype(np.float32)
+
 # Ridged multifractal for sharp mountains
 
 def ridged_fbm(w: int, h: int, octaves=6, base_grid=128, seed=0) -> np.ndarray:
     n = fbm(w, h, octaves=octaves, base_grid=base_grid, seed=seed)
-    ridged = 1.0 - np.abs(2*n - 1.0)  # peaks become bright
-    for k in range(2):  # add a bit more shape
+    ridged = 1.0 - np.abs(2*n - 1.0)
+    for k in range(2):
         ridged = np.clip(0.6*ridged + 0.4*(1.0 - np.abs(2*fbm(w,h,octaves=4,base_grid=base_grid//2,seed=seed+100+k)-1.0)), 0, 1)
     return ridged
 
@@ -104,21 +124,35 @@ def make_dem(biome: str, w: int, h: int, seed: int) -> np.ndarray:
         base = ridged_fbm(w, h, octaves=7, base_grid=256, seed=seed)
         macro = ridged_fbm(w, h, octaves=4, base_grid=512, seed=seed+1)
         dem = 0.7*base + 0.3*macro
-        # emphasize relief
         dem = dem**1.1
+    elif biome == 'desert':
+        base = fbm(w, h, octaves=5, base_grid=256, seed=seed)
+        dunes = dunes_noise(w, h, seed+5, scale=28, direction_deg=25)
+        plateaus = ridged_fbm(w, h, octaves=3, base_grid=512, seed=seed+9)
+        dem = 0.55*base + 0.30*plateaus + 0.15*dunes
+    elif biome == 'city':
+        base = fbm(w, h, octaves=5, base_grid=256, seed=seed)
+        dem = base**1.2
+        # flatten large area for the city platform
+        rng = np.random.default_rng(seed)
+        cx, cy = int(w*0.52), int(h*0.48)
+        rr = int(min(w,h)*0.18)
+        yy, xx = np.mgrid[0:h, 0:w]
+        mask = ((xx-cx)**2 + (yy-cy)**2) <= rr*rr
+        dem = np.where(mask, dem*0.2 + 0.15, dem)
     else:  # forest
         base = fbm(w, h, octaves=6, base_grid=256, seed=seed)
         detail = fbm(w, h, octaves=5, base_grid=64, seed=seed+1)
         dem = 0.65*base + 0.35*detail
 
-    # region mask so edges sink → coastlines
+    # region mask → coastlines
     yy, xx = np.mgrid[0:h, 0:w]
     cx, cy = w/2, h/2
     rad = np.sqrt(((xx-cx)/(0.62*w))**2 + ((yy-cy)/(0.62*h))**2)
     bowl = 1 - np.clip(rad, 0, 1)**2
     dem = 0.82*dem + 0.18*bowl
 
-    # add micro detail
+    # micro detail
     micro = fbm(w, h, octaves=3, base_grid=24, gain=0.6, seed=seed+77)
     dem = np.clip(dem + 0.06*(micro-0.5), 0, 1)
     dem = (dem - dem.min())/(dem.max()-dem.min()+1e-6)
@@ -135,7 +169,6 @@ def d8_flow(dem: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         for j in range(1, w-1):
             z = zi[j]
             best = 0.0; best_k = -1
-            # manual unroll for speed
             for k in range(8):
                 di, dj = offs[k]; dz = z - dem[i+di, j+dj]
                 if dz > best: best = dz; best_k = k
@@ -189,7 +222,7 @@ def river_mask(dem: np.ndarray, target_density=0.004) -> np.ndarray:
     thr = np.quantile(acc, 1.0 - target_density)
     rivers = acc >= thr
     rivers = cheap_blur(rivers.astype(np.float32), k=2) > 0.25
-    rivers &= (dem < 0.88)
+    rivers &= (dem < 0.90)
     return rivers
 
 # ------------------ Biome styling ------------------
@@ -220,7 +253,7 @@ def palette_forest(dem, moisture, water) -> Tuple[np.ndarray, np.ndarray]:
     forest_dense = (forest_score >= 0.55) & ~water
     rock = (dem > 0.78) & ~water
 
-    # water first
+    # water
     rgb[...,0] = np.where(water, 0.05, 0)
     rgb[...,1] = np.where(water, 0.40, 0)
     rgb[...,2] = np.where(water, 0.80, 0)
@@ -254,11 +287,106 @@ def palette_mountain(dem, moisture, water) -> Tuple[np.ndarray, np.ndarray]:
     rgb = np.zeros((h,w,3), np.float32)
     cover = np.zeros((h,w), np.uint8)
 
-    # zones
     snow = (dem > 0.82)
     bare = (dem > 0.68) & ~snow
     subalpine = (dem > 0.48) & ~bare & ~snow
     meadow = (dem <= 0.48) & ~water
+
+    rgb[...,0] = np.where(water, 0.06, 0)
+    rgb[...,1] = np.where(water, 0.42, 0)
+    rgb[...,2] = np.where(water, 0.78, 0)
+    cover = np.where(water, 0, cover)
+
+    rgb[...,0] = np.where(meadow, 0.36, rgb[...,0])
+    rgb[...,1] = np.where(meadow, 0.62, rgb[...,1])
+    rgb[...,2] = np.where(meadow, 0.28, rgb[...,2])
+    cover = np.where(meadow, 1, cover)
+
+    rgb[...,0] = np.where(subalpine, 0.15, rgb[...,0])
+    rgb[...,1] = np.where(subalpine, 0.42, rgb[...,1])
+    rgb[...,2] = np.where(subalpine, 0.18, rgb[...,2])
+    cover = np.where(subalpine, 2, cover)
+
+    rgb[...,0] = np.where(bare, 0.55, rgb[...,0])
+    rgb[...,1] = np.where(bare, 0.52, rgb[...,1])
+    rgb[...,2] = np.where(bare, 0.50, rgb[...,2])
+    cover = np.where(bare, 3, cover)
+
+    rgb[...,0] = np.where(snow, 0.95, rgb[...,0])
+    rgb[...,1] = np.where(snow, 0.95, rgb[...,1])
+    rgb[...,2] = np.where(snow, 0.97, rgb[...,2])
+    cover = np.where(snow, 4, cover)
+
+    return rgb, cover
+
+
+def palette_desert(dem, moisture, water) -> Tuple[np.ndarray, np.ndarray]:
+    h, w = dem.shape
+    rgb = np.zeros((h,w,3), np.float32)
+    cover = np.zeros((h,w), np.uint8)
+
+    sand = (dem <= 0.6) & ~water
+    shrubs = (dem > 0.6) & (moisture > 0.35) & ~water
+    plateau = (dem > 0.65) & (moisture <= 0.35) & ~water
+    crests = (dunes_noise(w,h,seed=42,scale=22,direction_deg=25) > 0.75) & sand
+
+    # water (wadis/rare lakes)
+    rgb[...,0] = np.where(water, 0.07, 0)
+    rgb[...,1] = np.where(water, 0.46, 0)
+    rgb[...,2] = np.where(water, 0.80, 0)
+    cover = np.where(water, 0, cover)
+
+    # sand base
+    rgb[...,0] = np.where(sand, 0.86, rgb[...,0])
+    rgb[...,1] = np.where(sand, 0.79, rgb[...,1])
+    rgb[...,2] = np.where(sand, 0.62, rgb[...,2])
+    cover = np.where(sand, 1, cover)
+
+    # semi-arid shrubs
+    rgb[...,0] = np.where(shrubs, 0.72, rgb[...,0])
+    rgb[...,1] = np.where(shrubs, 0.70, rgb[...,1])
+    rgb[...,2] = np.where(shrubs, 0.55, rgb[...,2])
+    cover = np.where(shrubs, 2, cover)
+
+    # rocky plateaus
+    rgb[...,0] = np.where(plateau, 0.58, rgb[...,0])
+    rgb[...,1] = np.where(plateau, 0.52, rgb[...,1])
+    rgb[...,2] = np.where(plateau, 0.48, rgb[...,2])
+    cover = np.where(plateau, 3, cover)
+
+    # dune crests overlay
+    rgb[...,0] = np.where(crests, 0.90, rgb[...,0])
+    rgb[...,1] = np.where(crests, 0.84, rgb[...,1])
+    rgb[...,2] = np.where(crests, 0.66, rgb[...,2])
+    cover = np.where(crests, 4, cover)
+
+    return rgb, cover
+
+
+def palette_city(dem, moisture, water, seed=0) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    h, w = dem.shape
+    rng = np.random.default_rng(seed)
+    rgb = np.zeros((h,w,3), np.float32)
+    cover = np.zeros((h,w), np.uint8)
+
+    # Procedural urban mask (denser near the flat city platform center)
+    yy, xx = np.mgrid[0:h, 0:w]
+    cx, cy = int(w*0.52), int(h*0.48)
+    r = np.hypot(xx-cx, yy-cy)/max(1,0.35*min(w,h))
+    base_density = np.clip(1.0 - r, 0, 1)
+    noise = fbm(w, h, octaves=4, base_grid=48, seed=seed+33)
+    urban_prob = 0.55*base_density + 0.45*noise
+    urban = urban_prob > 0.52
+
+    # Roads: generate from a soft Manhattan grid warped by noise
+    gx = ( (xx//64) % 2 == 0 )
+    gy = ( (yy//64) % 2 == 0 )
+    grid = gx | gy
+    # warp by noise
+    warp = fbm(w, h, octaves=3, base_grid=32, seed=seed+99)
+    roads = (grid & (warp>0.45)) | ((grid & ~urban) & (warp>0.62))
+
+    parks = (~urban) & (fbm(w, h, octaves=3, base_grid=64, seed=seed+71)>0.58)
 
     # water
     rgb[...,0] = np.where(water, 0.06, 0)
@@ -266,31 +394,38 @@ def palette_mountain(dem, moisture, water) -> Tuple[np.ndarray, np.ndarray]:
     rgb[...,2] = np.where(water, 0.78, 0)
     cover = np.where(water, 0, cover)
 
-    # meadow
-    rgb[...,0] = np.where(meadow, 0.36, rgb[...,0])
-    rgb[...,1] = np.where(meadow, 0.62, rgb[...,1])
-    rgb[...,2] = np.where(meadow, 0.28, rgb[...,2])
-    cover = np.where(meadow, 1, cover)
+    # base urban tones by density
+    low  = urban & (urban_prob <= 0.60)
+    med  = urban & (urban_prob > 0.60) & (urban_prob <= 0.75)
+    high = urban & (urban_prob > 0.75)
 
-    # subalpine forest
-    rgb[...,0] = np.where(subalpine, 0.15, rgb[...,0])
-    rgb[...,1] = np.where(subalpine, 0.42, rgb[...,1])
-    rgb[...,2] = np.where(subalpine, 0.18, rgb[...,2])
-    cover = np.where(subalpine, 2, cover)
+    rgb[...,0] = np.where(low, 0.55, rgb[...,0])
+    rgb[...,1] = np.where(low, 0.55, rgb[...,1])
+    rgb[...,2] = np.where(low, 0.55, rgb[...,2])
+    cover = np.where(low, 1, cover)
 
-    # bare rock
-    rgb[...,0] = np.where(bare, 0.55, rgb[...,0])
-    rgb[...,1] = np.where(bare, 0.52, rgb[...,1])
-    rgb[...,2] = np.where(bare, 0.50, rgb[...,2])
-    cover = np.where(bare, 3, cover)
+    rgb[...,0] = np.where(med, 0.48, rgb[...,0])
+    rgb[...,1] = np.where(med, 0.48, rgb[...,1])
+    rgb[...,2] = np.where(med, 0.48, rgb[...,2])
+    cover = np.where(med, 2, cover)
 
-    # snow/ice
-    rgb[...,0] = np.where(snow, 0.95, rgb[...,0])
-    rgb[...,1] = np.where(snow, 0.95, rgb[...,1])
-    rgb[...,2] = np.where(snow, 0.97, rgb[...,2])
-    cover = np.where(snow, 4, cover)
+    rgb[...,0] = np.where(high, 0.40, rgb[...,0])
+    rgb[...,1] = np.where(high, 0.40, rgb[...,1])
+    rgb[...,2] = np.where(high, 0.40, rgb[...,2])
+    cover = np.where(high, 3, cover)
 
-    return rgb, cover
+    # parks/greens
+    rgb[...,0] = np.where(parks & ~water, 0.22, rgb[...,0])
+    rgb[...,1] = np.where(parks & ~water, 0.55, rgb[...,1])
+    rgb[...,2] = np.where(parks & ~water, 0.25, rgb[...,2])
+    cover = np.where(parks & ~water, 4, cover)
+
+    # roads overlay (light)
+    rgb[...,0] = np.where(roads & ~water, 0.80, rgb[...,0])
+    rgb[...,1] = np.where(roads & ~water, 0.80, rgb[...,1])
+    rgb[...,2] = np.where(roads & ~water, 0.80, rgb[...,2])
+
+    return rgb, cover, urban.astype(np.uint8), roads.astype(np.uint8)
 
 # ------------------ IO ------------------
 
@@ -303,25 +438,19 @@ def write_geotiff(data: np.ndarray, px: float, path: str, bands=1, photometric=N
     if not RASTERIO_OK:
         return False
     import rasterio
-    h, w = (data.shape[0], data.shape[1]) if bands==1 else (data.shape[0], data.shape[1])
+    h, w = (data.shape[0], data.shape[1])
     transform = from_origin(0.0, h*px, px, px)
     kwargs = dict(
         driver='GTiff', height=h, width=w, dtype=rasterio.uint8,
         transform=transform, crs='EPSG:3857', tiled=False, compress='none', BIGTIFF='NO'
     )
-    if bands == 1:
-        count=1
-    else:
-        count=data.shape[2]
+    count = data.shape[2] if (bands != 1 and data.ndim==3) else 1
     kwargs['count'] = count
     if photometric:
         kwargs['photometric'] = photometric
     with rasterio.open(path, 'w', **kwargs) as dst:
-        if bands == 1:
-            if data.dtype != np.uint8:
-                arr = np.clip(data*255.0+0.5, 0, 255).astype(np.uint8)
-            else:
-                arr = data
+        if count == 1:
+            arr = data if data.dtype == np.uint8 else np.clip(data*255.0+0.5, 0, 255).astype(np.uint8)
             dst.write(arr, 1)
         else:
             arr = np.clip(data*255.0+0.5, 0, 255).astype(np.uint8)
@@ -366,13 +495,17 @@ def main(p: Params):
 
     if p.biome == 'mountain':
         rgb, cover = palette_mountain(dem, moisture, rivers)
-    else:
+    elif p.biome == 'desert':
+        rgb, cover = palette_desert(dem, moisture, rivers)
+    elif p.biome == 'city':
+        rgb, cover, urban, roads = palette_city(dem, moisture, rivers, seed=p.seed)
+    else:  # forest
         rgb, cover = palette_forest(dem, moisture, rivers)
 
-    # Apply light
+    # lighting
     rgb = np.clip(rgb*(0.62 + 0.38*hs[...,None]), 0, 1)
 
-    # Write layers
+    # Write common layers
     write_geotiff(rgb, p.pixel_size, os.path.join(p.outdir, 'rgb.tif'), bands=3, photometric='RGB')
     write_geotiff(dem, p.pixel_size, os.path.join(p.outdir, 'dem.tif'))
     write_geotiff(hs,  p.pixel_size, os.path.join(p.outdir, 'hillshade.tif'))
@@ -380,7 +513,12 @@ def main(p: Params):
     write_geotiff(rivers.astype(np.float32), p.pixel_size, os.path.join(p.outdir, 'water.tif'))
     write_geotiff(cover.astype(np.uint8), p.pixel_size, os.path.join(p.outdir, 'cover.tif'))
 
-    # Preview PNG
+    # Extra city layers
+    if p.biome == 'city':
+        write_geotiff(urban.astype(np.uint8), p.pixel_size, os.path.join(p.outdir, 'urban.tif'))
+        write_geotiff(roads.astype(np.uint8), p.pixel_size, os.path.join(p.outdir, 'roads.tif'))
+
+    # Preview
     save_png(rgb, os.path.join(p.outdir, 'preview.png'))
 
     print(f"✓ Wrote layered outputs to {p.outdir}")
@@ -388,7 +526,7 @@ def main(p: Params):
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
-    ap.add_argument('--biome', choices=['forest','mountain'], required=True)
+    ap.add_argument('--biome', choices=['forest','mountain','desert','city'], required=True)
     ap.add_argument('--size', type=int, default=2048)
     ap.add_argument('--seed', type=int, default=7)
     ap.add_argument('--pixel-size', type=float, default=1.0, help='meters per pixel in EPSG:3857')
